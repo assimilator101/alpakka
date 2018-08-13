@@ -4,24 +4,27 @@
 
 package akka.stream.alpakka.s3.impl
 
+import java.net.InetSocketAddress
 import java.time.{Instant, LocalDate}
 
-import scala.collection.immutable.Seq
-import scala.concurrent.{ExecutionContext, Future}
-import scala.util.{Failure, Success}
-import akka.{Done, NotUsed}
 import akka.actor.ActorSystem
-import akka.http.scaladsl.Http
 import akka.http.scaladsl.model.StatusCodes.{NoContent, NotFound, OK}
-import akka.http.scaladsl.model.headers.{`Content-Length`, ByteRange, CustomHeader}
 import akka.http.scaladsl.model._
+import akka.http.scaladsl.model.headers.{`Content-Length`, ByteRange, CustomHeader}
+import akka.http.scaladsl.settings.ConnectionPoolSettings
 import akka.http.scaladsl.unmarshalling.{Unmarshal, Unmarshaller}
+import akka.http.scaladsl.{ClientTransport, Http}
 import akka.stream.Materializer
 import akka.stream.alpakka.s3.auth.{CredentialScope, Signer, SigningKey}
 import akka.stream.alpakka.s3.scaladsl.{ListBucketResultContents, ObjectMetadata}
 import akka.stream.alpakka.s3.{DiskBufferType, MemoryBufferType, S3Exception, S3Settings}
 import akka.stream.scaladsl.{Flow, Keep, RunnableGraph, Sink, Source}
 import akka.util.ByteString
+import akka.{Done, NotUsed}
+
+import scala.collection.immutable.Seq
+import scala.concurrent.{ExecutionContext, Future}
+import scala.util.{Failure, Success}
 
 final case class S3Location(bucket: String, key: String)
 
@@ -139,7 +142,9 @@ private[alpakka] final class S3Stream(settings: S3Settings)(implicit system: Act
                         versionId: Option[String],
                         sse: Option[ServerSideEncryption]): Future[Option[ObjectMetadata]] = {
     implicit val ec = mat.executionContext
-    val s3Headers = S3Headers(sse.fold[Seq[HttpHeader]](Seq.empty) { _.headersFor(HeadObject) })
+    val s3Headers = S3Headers(sse.fold[Seq[HttpHeader]](Seq.empty) {
+      _.headersFor(HeadObject)
+    })
     request(S3Location(bucket, key), HttpMethods.HEAD, versionId = versionId, s3Headers = s3Headers).flatMap {
       case HttpResponse(OK, headers, entity, _) =>
         entity.discardBytes().future().map { _ =>
@@ -185,7 +190,7 @@ private[alpakka] final class S3Stream(settings: S3Settings)(implicit system: Act
 
     val resp = for {
       signedRequest <- Signer.signedRequest(req, signingKey)
-      resp <- Http().singleRequest(signedRequest)
+      resp <- Http().singleRequest(signedRequest, settings = connectionPoolSettings())
     } yield resp
 
     resp.flatMap {
@@ -236,7 +241,7 @@ private[alpakka] final class S3Stream(settings: S3Settings)(implicit system: Act
 
     val response = for {
       signedReq <- Signer.signedRequest(req, signingKey)
-      response <- Http().singleRequest(signedReq)
+      response <- Http().singleRequest(signedReq, settings = connectionPoolSettings())
     } yield response
     response.flatMap {
       case HttpResponse(status, _, entity, _) if status.isSuccess() =>
@@ -387,7 +392,7 @@ private[alpakka] final class S3Stream(settings: S3Settings)(implicit system: Act
 
     // The individual upload part requests are processed here
     requestFlow
-      .via(Http().superPool[(MultipartUpload, Int)]())
+      .via(Http().superPool[(MultipartUpload, Int)](settings = connectionPoolSettings()))
       .map {
         case (Success(r), (upload, index)) =>
           r.entity.dataBytes.runWith(Sink.ignore)
@@ -445,8 +450,32 @@ private[alpakka] final class S3Stream(settings: S3Settings)(implicit system: Act
     import mat.executionContext
     for {
       req <- Signer.signedRequest(request, signingKey)
-      res <- Http().singleRequest(req)
+      res <- Http().singleRequest(req, settings = connectionPoolSettings())
     } yield res
+  }
+
+  /**
+   * Add support for proxy with basic auth
+   */
+  private def connectionPoolSettings(): ConnectionPoolSettings = {
+    val connectionPool = ConnectionPoolSettings(system)
+    conf.proxy match {
+      case Some(proxy) =>
+        // rely on the host naming convention instead of changing Proxy case class
+        proxy.host.split('@') match {
+          case Array(userInfo, host) =>
+            val Array(user, passwd) = userInfo.split(':')
+            val auth = headers.BasicHttpCredentials(user, passwd)
+            val proxyAddress = InetSocketAddress.createUnresolved(host, proxy.port)
+            connectionPool.withTransport(ClientTransport.httpsProxy(proxyAddress, auth))
+          case Array(_) =>
+            val proxyAddress =
+              InetSocketAddress.createUnresolved(proxy.host, proxy.port)
+            connectionPool.withTransport(ClientTransport.httpsProxy(proxyAddress))
+        }
+      case None =>
+        connectionPool
+    }
   }
 
   private def entityForSuccess(
@@ -487,7 +516,9 @@ private[alpakka] final class S3Stream(settings: S3Settings)(implicit system: Act
                      contentType,
                      S3Headers(
                        s3Headers.headers ++
-                       sse.fold[Seq[HttpHeader]](Seq.empty) { _.headersFor(InitiateMultipartUpload) }
+                       sse.fold[Seq[HttpHeader]](Seq.empty) {
+                         _.headersFor(InitiateMultipartUpload)
+                       }
                      ))
 
     val headers: S3Headers = S3Headers(sse.fold[Seq[HttpHeader]](Seq.empty) { _.headersFor(CopyPart) })
@@ -513,7 +544,7 @@ private[alpakka] final class S3Stream(settings: S3Settings)(implicit system: Act
     import mat.executionContext
 
     requests
-      .via(Http().superPool[MultipartCopy]())
+      .via(Http().superPool[MultipartCopy](settings = connectionPoolSettings()))
       .map {
         case (Success(r), multipartCopy) =>
           val entity = r.entity
